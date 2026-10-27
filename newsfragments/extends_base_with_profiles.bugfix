@@ -1,0 +1,1 @@
+Fixed `extends` of a service whose base service has inactive profiles; the extending service now inherits the base service's profiles.

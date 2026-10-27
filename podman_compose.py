@@ -2407,10 +2407,8 @@ def resolve_extends(
                 raise KeyError(
                     f"{from_service_name} not found at services.{name}.extends definition"
                 ) from e
-            try:
-                del from_service["extends"]
-            except KeyError:
-                pass
+            from_service.pop("extends", None)
+            from_service.pop(DependField.DEPENDENTS, None)
         new_service = rec_merge({}, from_service, service)
         services[name] = new_service
 
@@ -2935,9 +2933,17 @@ class PodmanCompose:
                 # Solution is to remove 'include' key from compose obj. This doesn't break
                 # having `include` present and correctly processed in included files
                 del compose["include"]
-        resolved_services = self._resolve_profiles(
-            compose.get("services") or {}, target, requested_profiles
-        )
+        # Resolve `extends` against the full service set before profile filtering, so that a
+        # service can extend a base service whose profiles are not active, and so that the
+        # extending service inherits the base's profiles (as in Docker Compose).
+        all_services = compose.get("services") or {}
+        flat_deps(all_services, with_extends=True)
+        service_names = sorted([(len(srv["_deps"]), name) for name, srv in all_services.items()])
+        resolve_extends(all_services, [name for _, name in service_names], self.environ)
+        for srv in all_services.values():
+            srv.pop(DependField.DEPENDENCIES, None)
+            srv.pop(DependField.DEPENDENTS, None)
+        resolved_services = self._resolve_profiles(all_services, target, requested_profiles)
         compose["services"] = resolved_services
         if not getattr(args, "no_normalize", None):
             compose = normalize_final(compose, self.dirname)
@@ -2963,10 +2969,6 @@ class PodmanCompose:
         # include services with no profile defined or the selected profiles
         services = self._resolve_profiles(services, target, requested_profiles)
 
-        # NOTE: maybe add "extends.service" to _deps at this stage
-        flat_deps(services, with_extends=True)
-        service_names = sorted([(len(srv["_deps"]), name) for name, srv in services.items()])
-        resolve_extends(services, [name for _, name in service_names], self.environ)
         flat_deps(services)
 
         # networks: [...]
