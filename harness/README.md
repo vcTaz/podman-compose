@@ -20,6 +20,8 @@ The first command compares `config`. The second compares `config --profiles`. Th
 
 `compat.yml` sets `x-podman: docker_compose_compat: true`, so container names use `-` and no pod is created. Without it, `ps` always differs: podman-compose names containers with `_` by default.
 
+A step may start with global flags, as in `-- --profile debug config --services`. The script adds `-f` and `-p` itself.
+
 `python3 harness/compose_diff.py --help` prints the exit codes.
 
 Install steps and how to read a result are in `.cursor/skills/verify-compose-diff/SKILL.md`.

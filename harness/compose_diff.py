@@ -36,6 +36,7 @@ _SCRUBBED_ENV = frozenset({
     "PODMAN_COMPOSE_IN_POD",
 })
 _OWNED_FLAGS = frozenset({"-f", "--file", "-p", "--project-name"})
+_VALUE_FLAGS = frozenset({"--profile", "--env-file", "--project-directory", "--parallel"})
 
 
 class HarnessError(Exception):
@@ -65,6 +66,22 @@ class Step:
             raise HarnessError("empty step")
         if self.argv[0] in _OWNED_FLAGS:
             raise HarnessError(f"step cannot start with {self.argv[0]}")
+
+    @property
+    def command(self) -> str:
+        """The subcommand, after any global flags such as --profile NAME."""
+        tokens = iter(self.argv)
+        for token in tokens:
+            if token in _VALUE_FLAGS:
+                next(tokens, None)
+            elif not token.startswith("-"):
+                return token
+        return ""
+
+    @property
+    def command_args(self) -> tuple[str, ...]:
+        command = self.command
+        return self.argv[self.argv.index(command) + 1 :] if command else ()
 
 
 @dataclass(frozen=True)
@@ -222,7 +239,7 @@ def _engines(offline: bool) -> tuple[Engine, Engine]:
 
 def _offline(scenario: Scenario) -> bool:
     """config steps read the file only, so they need no daemon and no cleanup."""
-    return all(step.argv[0] == "config" for step in scenario.steps)
+    return all(step.command == "config" for step in scenario.steps)
 
 
 def _spawn(argv: tuple[str, ...], cwd: Path) -> CommandResult:
@@ -296,19 +313,19 @@ def _observations(
 
 
 def _match_profiles(step: Step) -> bool:
-    return step.argv[0] == "config" and "--profiles" in step.argv[1:]
+    return step.command == "config" and "--profiles" in step.command_args
 
 
 def _match_ps(step: Step) -> bool:
-    return step.argv[0] == "ps"
+    return step.command == "ps"
 
 
 def _match_config(step: Step) -> bool:
-    return step.argv[0] == "config"
+    return step.command == "config"
 
 
 def _match_lifecycle(step: Step) -> bool:
-    return step.argv[0] in ("up", "down")
+    return step.command in ("up", "down")
 
 
 def _build_lines(
