@@ -2411,6 +2411,8 @@ def resolve_extends(
                 del from_service["extends"]
             except KeyError:
                 pass
+            # In a chain, the base already carries its own dependents.
+            from_service.pop(DependField.DEPENDENTS, None)
         new_service = rec_merge({}, from_service, service)
         services[name] = new_service
 
@@ -2466,6 +2468,77 @@ def find_compose_files_recursively(
     return None
 
 
+def extends_base_name(config: Any) -> str | None:
+    """Name of the base service when `extends` points into the same file."""
+    if not isinstance(config, dict):
+        return None
+    ext = config.get("extends")
+    if isinstance(ext, str):
+        return ext
+    if isinstance(ext, dict) and not ext.get("file"):
+        return ext.get("service")
+    return None
+
+
+def effective_profiles(services: dict[str, Any]) -> dict[str, list[str]]:
+    """Profiles of each service, including those inherited through same-file `extends`."""
+    resolved: dict[str, list[str]] = {}
+
+    def resolve(name: str, seen: frozenset[str]) -> list[str]:
+        if name in resolved:
+            return resolved[name]
+        config = services.get(name)
+        if not isinstance(config, dict):
+            return []
+        own = config.get("profiles") or []
+        if not isinstance(own, list):
+            own = []
+        base = extends_base_name(config)
+        inherited = resolve(base, seen | {name}) if base and base not in seen else []
+        profiles = list(dict.fromkeys([*inherited, *own]))
+        resolved[name] = profiles
+        return profiles
+
+    for name in services:
+        resolve(name, frozenset())
+    return resolved
+
+
+def extends_bases(services: dict[str, Any], candidates: dict[str, Any]) -> dict[str, Any]:
+    """Services in `candidates` that `services` extend, directly or through a chain."""
+    bases: dict[str, Any] = {}
+    pending = [extends_base_name(config) for config in services.values()]
+    while pending:
+        name = pending.pop()
+        if not name or name in services or name in bases or name not in candidates:
+            continue
+        bases[name] = candidates[name]
+        pending.append(extends_base_name(candidates[name]))
+    return bases
+
+
+def printable_service(service: dict[str, Any]) -> dict[str, Any]:
+    """A resolved service as `config` prints it, without `extends` or internal keys."""
+    return {
+        key: value for key, value in service.items() if key != "extends" and not key.startswith("_")
+    }
+
+
+def declared_profile_names(services: dict[str, Any]) -> list[str]:
+    """Sorted unique profile names from every service, active or not."""
+    names: set[str] = set()
+    for config in services.values():
+        if not isinstance(config, dict):
+            continue
+        profiles = config.get("profiles") or []
+        if not isinstance(profiles, list):
+            continue
+        for profile in profiles:
+            if isinstance(profile, str):
+                names.add(profile)
+    return sorted(names)
+
+
 class PodmanCompose:
     class XPodmanSettingKey(Enum):
         DOCKER_COMPOSE_COMPAT = "docker_compose_compat"
@@ -2493,6 +2566,8 @@ class PodmanCompose:
         self.container_names_by_service: dict[str, list[str]]
         self.container_by_name: dict[str, Any]
         self.services: dict[str, Any]
+        self.declared_profiles: list[str] = []
+        self.used_networks: list[str] = []
         self.all_services: set[Any] = set()
         self.prefer_volume_over_mount = True
         self.x_podman: dict[PodmanCompose.XPodmanSettingKey, Any] = {}
@@ -2816,8 +2891,11 @@ class PodmanCompose:
         target_services = getattr(
             args, "services", None
         )  # example: command `build` can have several services
+        # `config --services` is a boolean flag, not a list of service names.
+        if not isinstance(target_services, list):
+            target_services = []
 
-        target = [target_service] if target_service else target_services or []
+        target = [target_service] if target_service else target_services
 
         compose: dict[str, Any] = {}
         # Iterate over files primitively to allow appending to files in-loop
@@ -2935,14 +3013,19 @@ class PodmanCompose:
                 # Solution is to remove 'include' key from compose obj. This doesn't break
                 # having `include` present and correctly processed in included files
                 del compose["include"]
-        resolved_services = self._resolve_profiles(
-            compose.get("services") or {}, target, requested_profiles
-        )
+        defined_services = compose.get("services") or {}
+        self.declared_profiles = declared_profile_names(defined_services)
+        resolved_services = self._resolve_profiles(defined_services, target, requested_profiles)
+        inactive_services = {
+            name: config
+            for name, config in defined_services.items()
+            if name not in resolved_services
+        }
         compose["services"] = resolved_services
         if not getattr(args, "no_normalize", None):
             compose = normalize_final(compose, self.dirname)
+            normalize_final({"services": inactive_services}, self.dirname)
         compose.pop("version", None)
-        self.merged_yaml = yaml.safe_dump(compose)
         merged_json_b = json.dumps(
             self.original_configuration(compose), separators=(",", ":")
         ).encode("utf-8")
@@ -2958,15 +3041,24 @@ class PodmanCompose:
         pod_name = self.resolve_pod_name()
 
         services: dict = compose.get("services", {})
-        if not services:
+        listing_profiles = getattr(args, "profiles", False)
+        if not services and not listing_profiles:
             log.warning("WARNING: No services defined")
         # include services with no profile defined or the selected profiles
         services = self._resolve_profiles(services, target, requested_profiles)
 
+        # An inactive service can still be the `extends` base of an active one.
+        # Resolve against it, then drop it.
+        pool = {**extends_bases(services, inactive_services), **services}
         # NOTE: maybe add "extends.service" to _deps at this stage
-        flat_deps(services, with_extends=True)
-        service_names = sorted([(len(srv["_deps"]), name) for name, srv in services.items()])
-        resolve_extends(services, [name for _, name in service_names], self.environ)
+        flat_deps(pool, with_extends=True)
+        service_names = sorted([(len(srv["_deps"]), name) for name, srv in pool.items()])
+        resolve_extends(pool, [name for _, name in service_names], self.environ)
+        services = {name: pool[name] for name in services}
+        self.merged_yaml = yaml.safe_dump({
+            **{key: value for key, value in compose.items() if not key.startswith("_")},
+            "services": {name: printable_service(srv) for name, srv in services.items()},
+        })
         flat_deps(services)
 
         # networks: [...]
@@ -3001,6 +3093,7 @@ class PodmanCompose:
             )
             allnets.update(srv_nets)
         given_nets = set(nets.keys())
+        self.used_networks = [name for name in nets if name in allnets]
         missing_nets = allnets - given_nets
         unused_nets = given_nets - allnets - set(["default"])
         if len(unused_nets):
@@ -3126,13 +3219,15 @@ class PodmanCompose:
         if requested_profiles is None:
             requested_profiles = set()
 
+        profiles_by_service = effective_profiles(defined_services)
+
         for service in target:
-            requested_profiles.update(defined_services.get(service, {}).get("profiles", []))
+            requested_profiles.update(profiles_by_service.get(service, []))
 
         services = {}
 
         for name, config in defined_services.items():
-            service_profiles = set(config.get("profiles", []))
+            service_profiles = set(profiles_by_service.get(name, []))
             if not service_profiles or requested_profiles.intersection(service_profiles):
                 services[name] = config
         return services
@@ -4865,12 +4960,42 @@ async def compose_logs(compose: PodmanCompose, args: argparse.Namespace) -> None
     await asyncio.gather(*tasks)
 
 
+def config_volume_names(compose: PodmanCompose) -> list[str]:
+    """Top-level volumes that an active service mounts, in declaration order."""
+    used: set[str] = set()
+    for cnt in compose.containers:
+        for volume in cnt.get("volumes", []):
+            mnt_dict = get_mnt_dict(compose, cnt, volume)
+            if mnt_dict.get("type") == "volume" and mnt_dict.get("source"):
+                used.add(mnt_dict["source"])
+    return [name for name in compose.vols or {} if name in used]
+
+
 @cmd_run(podman_compose, "config", "displays the compose file")
 async def compose_config(compose: PodmanCompose, args: argparse.Namespace) -> None:
+    # Precedence follows Docker Compose. --quiet does not hide these lists.
     if args.services:
         for service in compose.services:
-            if not args.quiet:
-                print(service)
+            print(service)
+        return
+    if getattr(args, "volumes", False):
+        for volume in config_volume_names(compose):
+            print(volume)
+        return
+    if getattr(args, "networks", False):
+        for network in compose.used_networks:
+            print(network)
+        return
+    if getattr(args, "profiles", False):
+        for profile in compose.declared_profiles:
+            print(profile)
+        return
+    if getattr(args, "images", False):
+        for service in compose.services:
+            names = compose.container_names_by_service.get(service) or []
+            image = compose.container_by_name[names[0]].get("image") if names else None
+            if image:
+                print(image)
         return
     if not args.quiet:
         print(compose.merged_yaml)
@@ -5490,6 +5615,18 @@ def compose_config_parse(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--services", help="Print the service names, one per line.", action="store_true"
+    )
+    parser.add_argument(
+        "--profiles", help="Print the profile names, one per line.", action="store_true"
+    )
+    parser.add_argument(
+        "--images", help="Print the image names, one per line.", action="store_true"
+    )
+    parser.add_argument(
+        "--volumes", help="Print the volume names, one per line.", action="store_true"
+    )
+    parser.add_argument(
+        "--networks", help="Print the network names, one per line.", action="store_true"
     )
     parser.add_argument(
         "-q",

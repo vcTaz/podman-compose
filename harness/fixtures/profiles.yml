@@ -1,0 +1,9 @@
+services:
+  web:
+    image: busybox:1.36
+    profiles:
+      - tools
+  db:
+    image: busybox:1.36
+    profiles:
+      - debug
